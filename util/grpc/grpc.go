@@ -23,6 +23,21 @@ import (
 	"github.com/argoproj/argo-cd/v3/common"
 )
 
+// errSignallingCreds is a wrapper around a TransportCredentials value, but
+// it will use the writeResult function to notify on error.
+type errSignallingCreds struct {
+	credentials.TransportCredentials
+	writeResult func(res any)
+}
+
+func (c *errSignallingCreds) ClientHandshake(ctx context.Context, addr string, rawConn net.Conn) (net.Conn, credentials.AuthInfo, error) {
+	conn, auth, err := c.TransportCredentials.ClientHandshake(ctx, addr, rawConn)
+	if err != nil {
+		c.writeResult(err)
+	}
+	return conn, auth, err
+}
+
 // LoggerRecoveryHandler return a handler for recovering from panics and returning error
 func LoggerRecoveryHandler(log *logrus.Entry) recovery.RecoveryHandlerFunc {
 	return func(p any) (err error) {
@@ -36,25 +51,44 @@ func LoggerRecoveryHandler(log *logrus.Entry) recovery.RecoveryHandlerFunc {
 // connection will be insecure (plain-text).
 // Lifted from: https://github.com/fullstorydev/grpcurl/blob/master/grpcurl.go
 func BlockingNewClient(ctx context.Context, network, address string, creds credentials.TransportCredentials, opts ...grpc.DialOption) (*grpc.ClientConn, error) {
-	proxyDialer := proxy.FromEnvironment()
-	rawConn, err := proxyDialer.Dial(network, address)
-	if err != nil {
-		return nil, fmt.Errorf("error dial proxy: %w", err)
-	}
-
-	if creds != nil {
-		rawConn, _, err = creds.ClientHandshake(ctx, address, rawConn)
-		if err != nil {
-			return nil, fmt.Errorf("error creating connection: %w", err)
+	result := make(chan any, 1)
+	writeResult := func(res any) {
+		// non-blocking write: we only need the first result
+		select {
+		case result <- res:
+		default:
 		}
 	}
-	customDialer := func(_ context.Context, _ string) (net.Conn, error) {
+
+	if creds == nil {
+		creds = insecure.NewCredentials()
+	}
+
+	// custom credentials and dialer will notify on error via the
+	// writeResult function
+	creds = &errSignallingCreds{
+		TransportCredentials: creds,
+		writeResult:          writeResult,
+	}
+
+	customDialer := func(ctx context.Context, address string) (net.Conn, error) {
+		// NB: We *could* handle the TLS handshake ourselves, in the custom
+		// dialer (instead of customizing both the dialer and the credentials).
+		// But that requires using WithInsecure dial option (so that the gRPC
+		// library doesn't *also* try to do a handshake). And that would mean
+		// that the library would send the wrong ":scheme" metaheader to
+		// servers: it would send "http" instead of "https" because it is
+		// unaware that TLS is actually in use.
+		rawConn, err := proxy.Dial(ctx, network, address)
+		if err != nil {
+			writeResult(err)
+		}
 		return rawConn, nil
 	}
 
 	opts = append(opts,
 		grpc.WithContextDialer(customDialer),
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithTransportCredentials(creds),
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{Time: common.GetGRPCKeepAliveTime()}),
 	)
 
